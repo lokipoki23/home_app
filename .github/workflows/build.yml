@@ -29,6 +29,7 @@ jobs:
           echo "file=$FILE" >> "$GITHUB_OUTPUT"
           echo "version=$NAME" >> "$GITHUB_OUTPUT"
           echo "APP_VERSION_NAME=$NAME" >> "$GITHUB_ENV"
+          echo "HTML_FILE=$FILE" >> "$GITHUB_ENV"
 
       - name: Generate Android project
         run: |
@@ -466,7 +467,7 @@ jobs:
           }
           EOF_FILE
           mkdir -p app/src/main/assets
-          cp "../${{ steps.html.outputs.file }}" app/src/main/assets/index.html
+          cp "../$HTML_FILE" app/src/main/assets/index.html
           # bundle the repo's image folders into the APK and point the HTML at them,
           # so images still load when the repo is private (and work offline)
           for d in ../*/; do
