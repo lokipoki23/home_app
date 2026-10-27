@@ -1,0 +1,515 @@
+# Home App -> APK
+# Put your .html file in the repo root (any name, e.g. 2_9_5_2.html).
+# Push / upload a new one and this builds a signed APK under Releases.
+# The highest version number wins (2_9_5_3 beats 2_9_5_2).
+
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # Pinned: ubuntu-latest moved to Ubuntu 26, which broke the Android setup.
+    # The 24.04 image ships with the Android SDK already installed.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pick the HTML file
+        id: html
+        run: |
+          FILE=$(ls *.html web/*.html 2>/dev/null | sort -V | tail -n 1)
+          if [ -z "$FILE" ]; then echo "No .html file found in the repo"; exit 1; fi
+          echo "Using $FILE"
+          NAME=$(basename "$FILE" .html | tr '_' '.')
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+          echo "version=$NAME" >> "$GITHUB_OUTPUT"
+          echo "APP_VERSION_NAME=$NAME" >> "$GITHUB_ENV"
+          echo "HTML_FILE=$FILE" >> "$GITHUB_ENV"
+
+      - name: Generate Android project
+        run: |
+          mkdir -p build-app && cd build-app
+          mkdir -p "$(dirname 'settings.gradle')"
+          cat > 'settings.gradle' <<'EOF_FILE'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "FrogWeather"
+          include ':app'
+          EOF_FILE
+          mkdir -p "$(dirname 'build.gradle')"
+          cat > 'build.gradle' <<'EOF_FILE'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          EOF_FILE
+          mkdir -p "$(dirname 'gradle.properties')"
+          cat > 'gradle.properties' <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          EOF_FILE
+          mkdir -p "$(dirname 'app/build.gradle')"
+          cat > 'app/build.gradle' <<'EOF_FILE'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.josh.frogweather'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'com.josh.frogweather'
+                  minSdk 26
+                  targetSdk 34
+                  // Auto-increments every GitHub build so new APKs install over old ones
+                  versionCode ((System.getenv('GITHUB_RUN_NUMBER') ?: '1').toInteger())
+                  versionName (System.getenv('APP_VERSION_NAME') ?: 'dev')
+              }
+
+              signingConfigs {
+                  release {
+                      storeFile file('release.keystore')
+                      storePassword 'frogweather'
+                      keyAlias 'frog'
+                      keyPassword 'frogweather'
+                  }
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                      signingConfig signingConfigs.release
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+
+              // index.html is ~750 KB; don't let aapt compress/mangle it
+              androidResources {
+                  noCompress 'html'
+              }
+          }
+
+          dependencies {
+              implementation 'androidx.webkit:webkit:1.11.0'
+          }
+          EOF_FILE
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+              <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+              <uses-permission android:name="android.permission.VIBRATE" />
+
+              <application
+                  android:label="Home App"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher"
+                  android:usesCleartextTraffic="true"
+                  android:hardwareAccelerated="true"
+                  android:theme="@style/AppTheme">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:screenOrientation="unspecified"
+                      android:windowSoftInputMode="adjustResize"
+                      android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+
+              <!-- lets the app hand links off to Maps / YouTube Music / browser on Android 11+ -->
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.VIEW" />
+                      <data android:scheme="https" />
+                  </intent>
+              </queries>
+          </manifest>
+          EOF_FILE
+          mkdir -p "$(dirname 'app/src/main/res/values/styles.xml')"
+          cat > 'app/src/main/res/values/styles.xml' <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
+                  <item name="android:windowBackground">@android:color/black</item>
+              </style>
+          </resources>
+          EOF_FILE
+          mkdir -p "$(dirname 'app/src/main/res/values-v28/styles.xml')"
+          cat > 'app/src/main/res/values-v28/styles.xml' <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
+                  <item name="android:windowBackground">@android:color/black</item>
+                  <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+              </style>
+          </resources>
+          EOF_FILE
+          mkdir -p "$(dirname 'app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml')"
+          cat > 'app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml' <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@drawable/ic_bg" />
+              <foreground android:drawable="@drawable/ic_fg" />
+          </adaptive-icon>
+          EOF_FILE
+          mkdir -p "$(dirname 'app/src/main/res/drawable/ic_bg.xml')"
+          cat > 'app/src/main/res/drawable/ic_bg.xml' <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:aapt="http://schemas.android.com/aapt"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+              <path android:pathData="M0,0h108v108h-108z">
+                  <aapt:attr name="android:fillColor">
+                      <gradient android:type="linear"
+                          android:startX="54" android:startY="0" android:endX="54" android:endY="108"
+                          android:startColor="#FF5EB6F0" android:endColor="#FF2F78C4" />
+                  </aapt:attr>
+              </path>
+          </vector>
+          EOF_FILE
+          mkdir -p "$(dirname 'app/src/main/res/drawable/ic_fg.xml')"
+          cat > 'app/src/main/res/drawable/ic_fg.xml' <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+              <!-- sun -->
+              <path android:fillColor="#FFFFD34D" android:pathData="M74,34m-9,0a9,9 0,1 1,18 0a9,9 0,1 1,-18 0" />
+              <!-- frog head -->
+              <path android:fillColor="#FF4CAF50" android:pathData="M30,66c0,-11 11,-18 24,-18s24,7 24,18c0,8 -10,13 -24,13s-24,-5 -24,-13z" />
+              <!-- eye bumps -->
+              <path android:fillColor="#FF4CAF50" android:pathData="M42,50m-8,0a8,8 0,1 1,16 0a8,8 0,1 1,-16 0" />
+              <path android:fillColor="#FF4CAF50" android:pathData="M66,50m-8,0a8,8 0,1 1,16 0a8,8 0,1 1,-16 0" />
+              <!-- eyes -->
+              <path android:fillColor="#FFFFFFFF" android:pathData="M42,50m-5,0a5,5 0,1 1,10 0a5,5 0,1 1,-10 0" />
+              <path android:fillColor="#FFFFFFFF" android:pathData="M66,50m-5,0a5,5 0,1 1,10 0a5,5 0,1 1,-10 0" />
+              <path android:fillColor="#FF1B1B1B" android:pathData="M43,51m-2.5,0a2.5,2.5 0,1 1,5 0a2.5,2.5 0,1 1,-5 0" />
+              <path android:fillColor="#FF1B1B1B" android:pathData="M67,51m-2.5,0a2.5,2.5 0,1 1,5 0a2.5,2.5 0,1 1,-5 0" />
+              <!-- smile -->
+              <path android:strokeColor="#FF1E5E22" android:strokeWidth="2.5" android:strokeLineCap="round"
+                  android:fillColor="#00000000" android:pathData="M44,67q10,7 20,0" />
+          </vector>
+          EOF_FILE
+          mkdir -p "$(dirname 'app/src/main/java/com/josh/frogweather/MainActivity.java')"
+          cat > 'app/src/main/java/com/josh/frogweather/MainActivity.java' <<'EOF_FILE'
+          package com.josh.frogweather;
+
+          import android.Manifest;
+          import android.annotation.SuppressLint;
+          import android.app.Activity;
+          import android.content.ActivityNotFoundException;
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.view.View;
+          import android.view.WindowInsets;
+          import android.view.WindowInsetsController;
+          import android.view.WindowManager;
+          import android.webkit.CookieManager;
+          import android.webkit.GeolocationPermissions;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebResourceResponse;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+
+          import androidx.webkit.WebViewAssetLoader;
+
+          import java.net.URISyntaxException;
+
+          public class MainActivity extends Activity {
+
+              // Served from a fake https origin so localStorage, geolocation, clipboard etc. behave like a real site
+              private static final String HOST = "appassets.androidplatform.net";
+              // fs=0 tells the page not to call requestFullscreen — the app is already fullscreen
+              private static final String START_URL = "https://" + HOST + "/assets/index.html?fs=0";
+
+              private static final int REQ_FILE = 1001;
+              private static final int REQ_LOCATION = 1002;
+
+              private WebView webView;
+              private ValueCallback<Uri[]> fileCallback;
+              private GeolocationPermissions.Callback geoCallback;
+              private String geoOrigin;
+
+              @SuppressLint("SetJavaScriptEnabled")
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  WebView.setWebContentsDebuggingEnabled(true); // chrome://inspect from your PC
+
+                  webView = new WebView(this);
+                  webView.setBackgroundColor(0xFF000000);
+                  setContentView(webView);
+                  goImmersive();
+
+                  WebSettings s = webView.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  s.setDatabaseEnabled(true);
+                  s.setGeolocationEnabled(true);
+                  s.setMediaPlaybackRequiresUserGesture(false);
+                  s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW); // Node-RED + camera on http://10.1.1.x
+                  s.setAllowFileAccess(false);
+                  s.setAllowContentAccess(true);
+                  s.setLoadWithOverviewMode(true);
+                  s.setUseWideViewPort(true);
+                  s.setSupportZoom(false);
+                  s.setJavaScriptCanOpenWindowsAutomatically(true);
+                  s.setSupportMultipleWindows(false); // window.open() becomes a navigation we can hand to Android
+
+                  CookieManager.getInstance().setAcceptCookie(true);
+                  CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true);
+
+                  webView.addJavascriptInterface(new Bridge(), "AndroidBridge");
+
+                  final WebViewAssetLoader loader = new WebViewAssetLoader.Builder()
+                          .setDomain(HOST)
+                          .addPathHandler("/assets/", new WebViewAssetLoader.AssetsPathHandler(this))
+                          .build();
+
+                  webView.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest req) {
+                          return loader.shouldInterceptRequest(req.getUrl());
+                      }
+
+                      @Override
+                      public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest req) {
+                          if (!req.isForMainFrame()) return false;          // iframes load normally
+                          Uri uri = req.getUrl();
+                          if (HOST.equals(uri.getHost())) return false;     // our own page
+                          openExternally(uri.toString());                   // maps, search, music, links…
+                          return true;
+                      }
+
+                      @Override
+                      public void onPageFinished(WebView view, String url) {
+                          // WebView has no Web Share API — route it to Android's share sheet
+                          view.evaluateJavascript(
+                              "if(!navigator.share){navigator.share=function(d){d=d||{};" +
+                              "AndroidBridge.share(d.title||'',d.text||'',d.url||'');return Promise.resolve();};}",
+                              null);
+                      }
+                  });
+
+                  webView.setWebChromeClient(new WebChromeClient() {
+                      @Override
+                      public void onGeolocationPermissionsShowPrompt(String origin, GeolocationPermissions.Callback cb) {
+                          if (hasLocationPermission()) {
+                              cb.invoke(origin, true, true);
+                          } else {
+                              geoOrigin = origin;
+                              geoCallback = cb;
+                              requestPermissions(new String[]{
+                                      Manifest.permission.ACCESS_FINE_LOCATION,
+                                      Manifest.permission.ACCESS_COARSE_LOCATION}, REQ_LOCATION);
+                          }
+                      }
+
+                      @Override
+                      public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> cb, FileChooserParams params) {
+                          if (fileCallback != null) fileCallback.onReceiveValue(null);
+                          fileCallback = cb;
+                          try {
+                              startActivityForResult(params.createIntent(), REQ_FILE);
+                          } catch (ActivityNotFoundException e) {
+                              fileCallback = null;
+                              return false;
+                          }
+                          return true;
+                      }
+                  });
+
+                  if (savedInstanceState != null) {
+                      webView.restoreState(savedInstanceState);
+                  } else {
+                      webView.loadUrl(START_URL);
+                  }
+              }
+
+              private boolean hasLocationPermission() {
+                  return checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+                          || checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+              }
+
+              private void openExternally(String url) {
+                  try {
+                      Intent i = url.startsWith("intent:")
+                              ? Intent.parseUri(url, Intent.URI_INTENT_SCHEME)
+                              : new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      startActivity(i);
+                  } catch (ActivityNotFoundException | URISyntaxException ignored) { }
+              }
+
+              private void goImmersive() {
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS);
+                  if (Build.VERSION.SDK_INT >= 30) {
+                      getWindow().setDecorFitsSystemWindows(false);
+                      WindowInsetsController c = getWindow().getInsetsController();
+                      if (c != null) {
+                          c.hide(WindowInsets.Type.systemBars());
+                          c.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+                      }
+                  } else {
+                      getWindow().getDecorView().setSystemUiVisibility(
+                              View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                              | View.SYSTEM_UI_FLAG_FULLSCREEN
+                              | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                              | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                              | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                              | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
+                  }
+              }
+
+              @Override
+              public void onWindowFocusChanged(boolean hasFocus) {
+                  super.onWindowFocusChanged(hasFocus);
+                  if (hasFocus) goImmersive();
+              }
+
+              @Override
+              public void onRequestPermissionsResult(int code, String[] perms, int[] results) {
+                  super.onRequestPermissionsResult(code, perms, results);
+                  if (code == REQ_LOCATION && geoCallback != null) {
+                      geoCallback.invoke(geoOrigin, hasLocationPermission(), true);
+                      geoCallback = null;
+                  }
+              }
+
+              @Override
+              protected void onActivityResult(int code, int result, Intent data) {
+                  super.onActivityResult(code, result, data);
+                  if (code == REQ_FILE && fileCallback != null) {
+                      fileCallback.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(result, data));
+                      fileCallback = null;
+                  }
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (webView.canGoBack()) webView.goBack();
+                  else moveTaskToBack(true); // keep the page alive instead of killing it
+              }
+
+              @Override
+              protected void onSaveInstanceState(Bundle out) {
+                  super.onSaveInstanceState(out);
+                  webView.saveState(out);
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  webView.onResume();
+                  webView.resumeTimers();
+              }
+
+              @Override
+              protected void onPause() {
+                  webView.onPause();
+                  CookieManager.getInstance().flush();
+                  super.onPause();
+              }
+
+              @Override
+              protected void onDestroy() {
+                  webView.destroy();
+                  super.onDestroy();
+              }
+
+              private class Bridge {
+                  @JavascriptInterface
+                  public void share(String title, String text, String url) {
+                      String body = text.isEmpty() ? url : (url.isEmpty() ? text : text + "\n" + url);
+                      Intent send = new Intent(Intent.ACTION_SEND);
+                      send.setType("text/plain");
+                      send.putExtra(Intent.EXTRA_SUBJECT, title);
+                      send.putExtra(Intent.EXTRA_TEXT, body);
+                      Intent chooser = Intent.createChooser(send, title.isEmpty() ? "Share" : title);
+                      chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      runOnUiThread(() -> startActivity(chooser));
+                  }
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/assets
+          cp "../$HTML_FILE" app/src/main/assets/index.html
+          # bundle the repo's image folders into the APK and point the HTML at them,
+          # so images still load when the repo is private (and work offline)
+          for d in ../*/; do
+            n=$(basename "$d")
+            [ "$n" = "build-app" ] && continue
+            echo "Bundling $n/"
+            cp -r "$d" "app/src/main/assets/$n"
+          done
+          sed -i \
+            -e 's#https://raw.githubusercontent.com/lokipoki23/home_app/refs/heads/main/#https://appassets.androidplatform.net/assets/#g' \
+            -e 's#https://raw.githubusercontent.com/lokipoki23/home_app/main/#https://appassets.androidplatform.net/assets/#g' \
+            app/src/main/assets/index.html
+          # signing key (same every build, so updates install over the old app)
+          echo 'MIIKMAIBAzCCCdoGCSqGSIb3DQEHAaCCCcsEggnHMIIJwzCCBaoGCSqGSIb3DQEHAaCCBZsEggWXMIIFkzCCBY8GCyqGSIb3DQEMCgECoIIFQDCCBTwwZgYJKoZIhvcNAQUNMFkwOAYJKoZIhvcNAQUMMCsEFD0991x6BIvxJnTBM2xseHo4jSbSAgInEAIBIDAMBggqhkiG9w0CCQUAMB0GCWCGSAFlAwQBKgQQOvgVoWfEwoTEzRDHThAf1QSCBNBALharm7XVr67kGqeCPoczmCpj/0jaKSfbmECDYEdfI4HirlE6RUVeD2XlVMGroIyS/TjcUnGDmNeJIluoQXBBfEd2ILWAELxf6Wx/ZkGDCabTZuiqvpc6/gBG8MBptnfSXp4kErWJTNqpQsy0FLKemKIZH2envWCID54HNd0IJ5xS6ejW39jmJ4RNOIlxDzOLZw8Wtq0rE7JuLkkNDPf4b/kpCcStA5iT166QtgYtXe+IVGsuMtVmsRMIptmXqghGepj+Sy/uJ91MBEMQ4YfcVqrSnJn4kRHGkpmV+tqAlj4Lq9Oci8YS3KCqUrGjI+YVuBgiaLuLQKePywCQ+vNtfsb7l60lj8SiQ03MJ9hYH1zCOOVQ0VlKWzMIPIQ+FwWzeXfRfi93GZFN7Ips1S1ZJSMzhPjoRxPzuC7sXkDIkDne92xU/CrWa40gtINwuBOh8bqTSfC+vrTXZz9i/okCg0UjEAbMDe9FWr/EIWarcFsMFf/uqDn2M5SrSuTA2Jodqgn/A7lkQ9y2744ZhlyxI+odsAMsmUOxEigtQeZHOv0IyUe/SCHB0pdcTjKET54QWdRSBh09osQQqdyYW6w4WMN9Fe0A4B+9EpFV1UqMr8n2lowl7eRwrk6qxgzbrbdJT3zucBvv8HkUSpXA+xW61t972FX9hCRRiW8tCCvHKDAZQGwBh/aOzkgJB/ygthkixxzHKQ7g0nVDSqS1c9t32kqGWAiChKIg7XxvMd2MHzPNNvDPlEu9qzy7G5ChtUbY2LfjktqpNKaGmi33d/Snq3UO10ocpp2dstqFY/ssmVCAWQk6xO/KqLmX655WrDyRildNYtm1CEX/CQQXzKwjFcIWS32rwDtw+k+t8wcXl8e5XqmS5U/QkF+oCEgvBE1wgWmslkiSbAk6uxWdtzdZQPLqmVTASYRixj3eldnh6vkv++4FSTit8hm3kWTK6shfJ9EZ/k8CEmM/fJyxXVzQAxNiDaz5OMZpu1NsLizoVWzPIHH1OzuPXibbX+IgxPMrzkXnrszltCfFfnoEHT1to33nqmb1BaIZPbh+R64GQfIi+VvjOu3hGRDQpamvUkWyisSQOCnSQxMkubsD1Uwk9NSYqeNGa2R3STNhj78laWr/w6o5yjC05m0F5t3SP9lAC6bLOnnn5QVyxAAbXXkXO5NessNdjmN+Wg90vjcI1+GTc6ClNAXf8l/OKTRDzRk34DCr26kclNWQSsEEQn5j3D++0NM13kG//9zVij4FXzjp6K729ZCmi3+Vm/j6YK3134J+fbfa9elV+bR3HFGoZTaY/C/9eAK5ErpfjOEzIDV6/+0cYqKJYZp62Oktg891RgATluLkU0jipkuFyOVWcB9c8kLqDSQ3auXrSaQEAQmH+H75WOc0v5/y+otnuI3eWXiHql+m4/usWfRdOYbxvTvyeO7+dkU4mWVq7dxVzgps6qhTfCPu50etgfffGiT/516LyM/eoouCgMNPlT12LXeBhqOzdAatu+SbU0vTTwaaX2yju+hLObzb8+0wqM+ABXtfkP5CIjU/oq1X+dQR93rxXaVZ0gFkBUxjvYy7uxGwQmZp0Z1kUWYM6qVX1hTvC5vRmX2jR8I/VsxmwBDLYc0A+N5ihmNuXBVVCZwdGjE8MBcGCSqGSIb3DQEJFDEKHggAZgByAG8AZzAhBgkqhkiG9w0BCRUxFAQSVGltZSAxNzkzMDU5NjgxNzk1MIIEEQYJKoZIhvcNAQcGoIIEAjCCA/4CAQAwggP3BgkqhkiG9w0BBwEwZgYJKoZIhvcNAQUNMFkwOAYJKoZIhvcNAQUMMCsEFAxv8DkHW8v1O/Z7iVgJ06LUywqHAgInEAIBIDAMBggqhkiG9w0CCQUAMB0GCWCGSAFlAwQBKgQQvev9V2kekRUTc3kLe1TH+oCCA4Dge1KOJBA9z55A69Dd2s8UMVdZrv0MclAldvsdyYCm0z7VvCeLSCxcbsD/i+Cv2Hw5G71xSw8+k8oWdJmc4QmZ+aHT92rEVHksZ84a3Jiwx85HBcFDBD8CSHRfZEmgiYFmSPEpEGShYaiT36veSiDT09cmWhQXk0kTZ6dW4HnpJhSLKS/1unEfYMX5UbySumFl5Ze1KPhhKfzbUBP71lpGrw2MKzw0ZcILSCVkyDTDlJBPFPZP74bAmYZe2TvvgRp0eYsFjJ6OgO2ghqIa6yrHnUoyqOvIxmfSeWIguOjSsme3zZ+FRWDALGY5/v+Ikh3ymrmG1r2BMsksRun16Av1bRUUgcSsanQAJYw+QSRDtSaMh8ZjECMU/IsXsAtGvXOZtftYdkIunKSGeGwvalEMwYcg/gmUAMUvxD3VQuEfsKEEh/Z5PPDG1ENVs5oqGD5EU6FAWjXglvObGhxRSJE/ZQRhd8nvta9o7ZvtZs7fwsbvelqzqbRKnlNoPXY8hLR9q9s/OTqdgRi0TmRFh1nkANi6JFvsNV5ORVX4vYtL1PpegeTBQ2h87v9wmAnRrizFg8OtpBxHBMo9tDy7A87e30dtN7CwDGKxWo63RIqad73jbTQ4c9BEzwStw9lVOXfa+Ne+7ar4mwnEtpkXEasr1OjG9yK+1m4w6gS457Ms37e51EiQge1bD+iZnZSrIPaCSKlutzMAqIYUEMwLGDoTjLa032N7dKs0CjjGY+Oh3TqtGumFiEMPba3H2aq/dW2U34XYqyqeKODBurp/yVmkoOaLbF16RhthlDDVrnHH8feu0RpsSGZw6zQp8U5+D8pbl4ex8K5ebHhIHjlc4IhRwZsDuha98mh7bPEAgHd0zRN6D1bVCJtCHBJ4yomlDxu5wfsbI5/XYARhsDn1NNA5yUCR2jTmCuA1WZ/gOyI2PU9BaX1lsztqmZb+QCg1EQWdbqh9cmrx4d/ZPxWBMgFianmxKQ2b1Qd7NCQPnJkfuQaphovJ6rvL5EGzDWkRZqRJ+yd0B8c+YUwZUtSEnCMNqWC/aF12jWszIOBIBVLc/4/WaJOC/maeOuQDbfBJR5xyaErSwv7324aIFWjA6UnPwHxxwKna36qQrLZ3oQWRj3E8xt3YGeBFWDqSbinDIYMqH7FDR6kSIAtuckBfcFlwEjvOVRDHz7Sn+kRmnu3sdDBNMDEwDQYJYIZIAWUDBAIBBQAEIJQlCEjrDUPGHJ+OkC9gm6CIUcWfg1CFMxw/TtZXx9vQBBSQh3A9zv+bjrYbi1WSC8sFAjlf1gICJxA=' | base64 -d > app/release.keystore
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Build signed APK
+        working-directory: build-app
+        run: gradle assembleRelease --no-daemon
+
+      - name: Rename APK
+        run: cp build-app/app/build/outputs/apk/release/app-release.apk "HomeApp-${{ steps.html.outputs.version }}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HomeApp-${{ steps.html.outputs.version }}
+          path: HomeApp-*.apk
+
+      - name: Publish as a GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.html.outputs.version }}-${{ github.run_number }}
+          name: Home App ${{ steps.html.outputs.version }} (build ${{ github.run_number }})
+          files: HomeApp-*.apk
+          make_latest: true
