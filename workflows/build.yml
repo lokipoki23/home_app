@@ -1,4 +1,4 @@
-# Frog Weather -> APK
+# Home App -> APK
 # Put your .html file in the repo root (any name, e.g. 2_9_5_2.html).
 # Push / upload a new one and this builds a signed APK under Releases.
 # The highest version number wins (2_9_5_3 beats 2_9_5_2).
@@ -119,7 +119,7 @@ jobs:
               <uses-permission android:name="android.permission.VIBRATE" />
 
               <application
-                  android:label="Frog Weather"
+                  android:label="Home App"
                   android:icon="@mipmap/ic_launcher"
                   android:roundIcon="@mipmap/ic_launcher"
                   android:usesCleartextTraffic="true"
@@ -486,17 +486,17 @@ jobs:
         run: gradle assembleRelease --no-daemon
 
       - name: Rename APK
-        run: cp build-app/app/build/outputs/apk/release/app-release.apk "FrogWeather-${{ steps.html.outputs.version }}.apk"
+        run: cp build-app/app/build/outputs/apk/release/app-release.apk "HomeApp-${{ steps.html.outputs.version }}.apk"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: FrogWeather-${{ steps.html.outputs.version }}
-          path: FrogWeather-*.apk
+          name: HomeApp-${{ steps.html.outputs.version }}
+          path: HomeApp-*.apk
 
       - name: Publish as a GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.html.outputs.version }}-${{ github.run_number }}
-          name: Frog Weather ${{ steps.html.outputs.version }} (build ${{ github.run_number }})
-          files: FrogWeather-*.apk
+          name: Home App ${{ steps.html.outputs.version }} (build ${{ github.run_number }})
+          files: HomeApp-*.apk
           make_latest: true
