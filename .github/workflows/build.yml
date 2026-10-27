@@ -470,6 +470,8 @@ jobs:
           EOF_FILE
           mkdir -p app/src/main/assets
           cp "../$HTML_FILE" app/src/main/assets/index.html
+          # stamp this build's number/version into the page so it can check GitHub for a newer one
+          sed -i "s/__APP_BUILD__/$GITHUB_RUN_NUMBER/g; s/__APP_VERSION__/$APP_VERSION_NAME/g" app/src/main/assets/index.html
           # bundle the repo's image folders into the APK and point the HTML at them,
           # so images still load when the repo is private (and work offline)
           for d in ../*/; do
