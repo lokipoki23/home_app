@@ -77,6 +77,13 @@ jobs:
                   // Auto-increments every GitHub build so new APKs install over old ones
                   versionCode ((System.getenv('GITHUB_RUN_NUMBER') ?: '1').toInteger())
                   versionName (System.getenv('APP_VERSION_NAME') ?: 'dev')
+                  // in-app updates: this repo, plus the UPDATE_TOKEN secret if the repo is private
+                  buildConfigField 'String', 'UPDATE_REPO', '"' + (System.getenv('GITHUB_REPOSITORY') ?: '') + '"'
+                  buildConfigField 'String', 'UPDATE_TOKEN', '"' + (System.getenv('UPDATE_TOKEN') ?: '') + '"'
+              }
+
+              buildFeatures {
+                  buildConfig true
               }
 
               signingConfigs {
@@ -120,6 +127,8 @@ jobs:
               <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
               <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
               <uses-permission android:name="android.permission.VIBRATE" />
+              <!-- lets the app install its own updates (Settings → App → Update) -->
+              <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
               <application
                   android:label="Home App"
@@ -141,6 +150,9 @@ jobs:
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
                   </activity>
+
+                  <!-- result of installing an update -->
+                  <receiver android:name=".InstallReceiver" android:exported="false" />
               </application>
 
               <!-- lets the app hand links off to Maps / YouTube Music / browser on Android 11+ -->
@@ -957,11 +969,16 @@ jobs:
               private ValueCallback<Uri[]> fileCallback;
               private GeolocationPermissions.Callback geoCallback;
               private String geoOrigin;
+              private Updater updater;
+              private boolean startupCheckDone = false;
+              static MainActivity current;                    // for InstallReceiver
 
               @SuppressLint("SetJavaScriptEnabled")
               @Override
               protected void onCreate(Bundle savedInstanceState) {
                   super.onCreate(savedInstanceState);
+                  current = this;
+                  updater = new Updater(this);
 
                   WebView.setWebContentsDebuggingEnabled(true); // chrome://inspect from your PC
 
@@ -989,6 +1006,7 @@ jobs:
                   CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true);
 
                   webView.addJavascriptInterface(new Bridge(), "AndroidBridge");
+                  webView.addJavascriptInterface(new AppBridge(), "AndroidApp");   // version + in-app updates
 
                   final WebViewAssetLoader loader = new WebViewAssetLoader.Builder()
                           .setDomain(HOST)
@@ -1017,6 +1035,11 @@ jobs:
                               "if(!navigator.share){navigator.share=function(d){d=d||{};" +
                               "AndroidBridge.share(d.title||'',d.text||'',d.url||'');return Promise.resolve();};}",
                               null);
+                          // quietly look for a new build once per launch
+                          if (!startupCheckDone) {
+                              startupCheckDone = true;
+                              view.postDelayed(() -> updater.check(true), 3000);
+                          }
                       }
                   });
 
@@ -1142,8 +1165,39 @@ jobs:
 
               @Override
               protected void onDestroy() {
+                  if (current == this) current = null;
                   webView.destroy();
                   super.onDestroy();
+              }
+
+              /** Calls window.onAppUpdate(json) in the page. */
+              void sendUpdateState(String json) {
+                  runOnUiThread(() -> {
+                      if (webView != null) webView.evaluateJavascript("window.onAppUpdate && window.onAppUpdate(" + json + ")", null);
+                  });
+              }
+
+              /** window.AndroidApp.* — the same calls as the Movies & TV app (Settings → App in the page). */
+              private class AppBridge {
+                  @JavascriptInterface
+                  public String appVersion() { return BuildConfig.VERSION_NAME; }
+
+                  @JavascriptInterface
+                  public void checkUpdate() { updater.check(false); }
+
+                  @JavascriptInterface
+                  public void installUpdate() { updater.install(); }
+
+                  @JavascriptInterface
+                  public void openUrl(String url) {
+                      if (url == null || url.isEmpty()) return;
+                      runOnUiThread(() -> openExternally(url));
+                  }
+
+                  @JavascriptInterface
+                  public void share(String title, String url) {
+                      new Bridge().share(title == null ? "" : title, "", url == null ? "" : url);
+                  }
               }
 
               private class Bridge {
@@ -1158,6 +1212,261 @@ jobs:
                       chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                       runOnUiThread(() -> startActivity(chooser));
                   }
+              }
+          }
+          EOF_FILE
+          cat > 'app/src/main/java/com/josh/frogweather/Updater.java' <<'EOF_FILE'
+          package com.josh.frogweather;
+
+          import android.app.PendingIntent;
+          import android.content.Intent;
+          import android.content.pm.PackageInfo;
+          import android.content.pm.PackageInstaller;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.provider.Settings;
+
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+
+          import java.io.ByteArrayOutputStream;
+          import java.io.File;
+          import java.io.FileInputStream;
+          import java.io.FileOutputStream;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.time.Instant;
+          import java.util.regex.Matcher;
+          import java.util.regex.Pattern;
+
+          /**
+           * In-app updates (same as the Movies & TV app): checks the repo's latest GitHub Release,
+           * downloads its APK inside the app and hands it to Android's installer.
+           * Reports progress to the page as window.onAppUpdate({ state, ... }).
+           *
+           * "Newer" = the release tag's build number (v<version>-<build>) is higher than this
+           * build's versionCode (the GitHub run number). Tags without one fall back to the upload time.
+           * A public repo needs no token; a private one needs the UPDATE_TOKEN repository secret.
+           */
+          final class Updater {
+
+              private static final String API = "https://api.github.com/repos/";
+              private static final Pattern BUILD = Pattern.compile("-(\\d+)$");
+              private final MainActivity act;
+              private volatile boolean busy = false;
+              private String assetUrl;          // API url of the APK in the latest release
+              private String latestVersion = "";
+
+              Updater(MainActivity act) { this.act = act; }
+
+              private boolean configured() { return !BuildConfig.UPDATE_REPO.isEmpty(); }
+
+              // ── Check ──────────────────────────────────────────────────────────────
+              void check(boolean quiet) {
+                  if (!configured()) { send(state("off", "quiet", quiet)); return; }
+                  if (busy) return;
+                  busy = true;
+                  if (!quiet) send(state("checking"));
+                  new Thread(() -> {
+                      try {
+                          JSONObject rel = new JSONObject(new String(get(API + BuildConfig.UPDATE_REPO + "/releases/latest"), "UTF-8"));
+                          String tag = rel.optString("tag_name", "").replaceFirst("^v", "");
+                          Matcher m = BUILD.matcher(tag);
+                          long build = m.find() ? Long.parseLong(m.group(1)) : -1;
+                          latestVersion = build >= 0 ? tag.substring(0, m.start()) : tag;
+                          JSONArray assets = rel.optJSONArray("assets");
+                          JSONObject apk = null;
+                          if (assets != null) for (int i = 0; i < assets.length(); i++) {
+                              JSONObject a = assets.getJSONObject(i);
+                              if (a.optString("name").endsWith(".apk")) { apk = a; break; }
+                          }
+                          if (apk == null) { send(state("current", "version", latestVersion, "quiet", quiet)); return; }
+                          assetUrl = apk.getString("url");
+                          boolean newer;
+                          if (build >= 0) {
+                              newer = build > BuildConfig.VERSION_CODE;
+                          } else {
+                              long uploaded = Instant.parse(apk.getString("updated_at")).toEpochMilli();
+                              PackageInfo me = act.getPackageManager().getPackageInfo(act.getPackageName(), 0);
+                              newer = uploaded > me.lastUpdateTime + 60_000;
+                          }
+                          send(state(newer ? "available" : "current", "version", latestVersion, "quiet", quiet));
+                      } catch (Exception e) {
+                          send(state("error", "message", reason(e), "quiet", quiet));
+                      } finally {
+                          busy = false;
+                      }
+                  }).start();
+              }
+
+              // ── Download + install ─────────────────────────────────────────────────
+              void install() {
+                  if (busy) return;
+                  if (assetUrl == null) { check(false); return; }
+                  if (!act.getPackageManager().canRequestPackageInstalls()) {
+                      // First time: Android needs "Install unknown apps" switched on for this app
+                      act.runOnUiThread(() -> act.startActivity(new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                              Uri.parse("package:" + act.getPackageName()))));
+                      send(state("permission"));
+                      return;
+                  }
+                  busy = true;
+                  new Thread(() -> {
+                      try {
+                          File apk = download();
+                          send(state("installing", "version", latestVersion));
+                          installApk(apk);
+                      } catch (Exception e) {
+                          send(state("failed", "message", reason(e)));
+                      } finally {
+                          busy = false;
+                      }
+                  }).start();
+              }
+
+              private File download() throws Exception {
+                  send(state("downloading", "pct", 0));
+                  // GitHub answers with a redirect to a signed download link, which is fetched without the token
+                  HttpURLConnection c = open(assetUrl, "application/octet-stream");
+                  c.setInstanceFollowRedirects(false);
+                  int code = c.getResponseCode();
+                  if (code == 301 || code == 302 || code == 307) {
+                      String loc = c.getHeaderField("Location");
+                      c.disconnect();
+                      c = (HttpURLConnection) new URL(loc).openConnection();
+                      c.setConnectTimeout(15000);
+                      c.setReadTimeout(30000);
+                      code = c.getResponseCode();
+                  }
+                  if (code != 200) throw new Exception("download failed (HTTP " + code + ")");
+                  long total = c.getContentLengthLong();
+                  File out = new File(act.getCacheDir(), "update.apk");
+                  try (InputStream in = c.getInputStream(); OutputStream os = new FileOutputStream(out)) {
+                      byte[] buf = new byte[64 * 1024];
+                      long done = 0; int n, lastPct = -1;
+                      while ((n = in.read(buf)) > 0) {
+                          os.write(buf, 0, n);
+                          done += n;
+                          if (total > 0) {
+                              int pct = (int) (done * 100 / total);
+                              if (pct != lastPct && pct % 5 == 0) { lastPct = pct; send(state("downloading", "pct", pct)); }
+                          }
+                      }
+                  } finally {
+                      c.disconnect();
+                  }
+                  return out;
+              }
+
+              private void installApk(File apk) throws Exception {
+                  PackageInstaller pi = act.getPackageManager().getPackageInstaller();
+                  PackageInstaller.SessionParams params = new PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL);
+                  if (Build.VERSION.SDK_INT >= 31) {
+                      // later updates can go through without a prompt once this app installed the current one
+                      params.setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_NOT_REQUIRED);
+                  }
+                  int id = pi.createSession(params);
+                  try (PackageInstaller.Session session = pi.openSession(id)) {
+                      try (InputStream in = new FileInputStream(apk);
+                           OutputStream os = session.openWrite("update.apk", 0, apk.length())) {
+                          byte[] buf = new byte[64 * 1024];
+                          int n;
+                          while ((n = in.read(buf)) > 0) os.write(buf, 0, n);
+                          session.fsync(os);
+                      }
+                      int flags = PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= 31 ? PendingIntent.FLAG_MUTABLE : 0);
+                      PendingIntent done = PendingIntent.getBroadcast(act, id, new Intent(act, InstallReceiver.class), flags);
+                      session.commit(done.getIntentSender());
+                  }
+              }
+
+              // ── Helpers ────────────────────────────────────────────────────────────
+              private HttpURLConnection open(String url, String accept) throws Exception {
+                  HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+                  c.setConnectTimeout(15000);
+                  c.setReadTimeout(30000);
+                  if (!BuildConfig.UPDATE_TOKEN.isEmpty()) c.setRequestProperty("Authorization", "Bearer " + BuildConfig.UPDATE_TOKEN);
+                  c.setRequestProperty("Accept", accept);
+                  c.setRequestProperty("User-Agent", "HomeApp-Updater");
+                  c.setRequestProperty("X-GitHub-Api-Version", "2022-11-28");
+                  return c;
+              }
+
+              private byte[] get(String url) throws Exception {
+                  HttpURLConnection c = open(url, "application/vnd.github+json");
+                  try {
+                      int code = c.getResponseCode();
+                      if (code == 401) throw new Exception("GitHub rejected the token (expired?)");
+                      if (code == 403) throw new Exception("GitHub limit reached, try again in an hour");
+                      if (code == 404) throw new Exception("no release found (a private repo needs the UPDATE_TOKEN secret)");
+                      if (code != 200) throw new Exception("GitHub answered HTTP " + code);
+                      try (InputStream in = c.getInputStream()) {
+                          ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                          byte[] buf = new byte[16 * 1024];
+                          int n;
+                          while ((n = in.read(buf)) > 0) bo.write(buf, 0, n);
+                          return bo.toByteArray();
+                      }
+                  } finally {
+                      c.disconnect();
+                  }
+              }
+
+              private static String reason(Exception e) {
+                  String m = e.getMessage();
+                  if (e instanceof java.net.UnknownHostException) return "no internet connection";
+                  return m == null || m.isEmpty() ? e.getClass().getSimpleName() : m;
+              }
+
+              /** state("available", "version", "2.9.5.2-1-21", "quiet", true) → {"state":"available","installed":"2.9.5.2-1-20",...} */
+              private static JSONObject state(String s, Object... kv) {
+                  JSONObject o = new JSONObject();
+                  try {
+                      o.put("state", s).put("installed", BuildConfig.VERSION_NAME);
+                      for (int i = 0; i + 1 < kv.length; i += 2) o.put((String) kv[i], kv[i + 1]);
+                  } catch (Exception ignored) { }
+                  return o;
+              }
+
+              private void send(JSONObject o) { act.sendUpdateState(o.toString()); }
+          }
+          EOF_FILE
+          cat > 'app/src/main/java/com/josh/frogweather/InstallReceiver.java' <<'EOF_FILE'
+          package com.josh.frogweather;
+
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.pm.PackageInstaller;
+
+          import org.json.JSONObject;
+
+          /** Gets the result of installing an update: shows Android's confirm screen, or reports a failure. */
+          public class InstallReceiver extends BroadcastReceiver {
+              @Override
+              @SuppressWarnings("deprecation")
+              public void onReceive(Context ctx, Intent intent) {
+                  int status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE);
+                  if (status == PackageInstaller.STATUS_PENDING_USER_ACTION) {
+                      Intent confirm = intent.getParcelableExtra(Intent.EXTRA_INTENT);
+                      if (confirm != null) {
+                          confirm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                          ctx.startActivity(confirm);
+                      }
+                      return;
+                  }
+                  if (status == PackageInstaller.STATUS_SUCCESS) return;   // the app restarts on the new version
+                  MainActivity a = MainActivity.current;
+                  if (a == null) return;
+                  String msg = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE);
+                  if (status == PackageInstaller.STATUS_FAILURE_ABORTED) msg = "cancelled";
+                  try {
+                      JSONObject o = new JSONObject().put("state", "failed").put("message", msg == null ? "install failed" : msg)
+                              .put("installed", BuildConfig.VERSION_NAME);
+                      a.sendUpdateState(o.toString());
+                  } catch (Exception ignored) { }
               }
           }
           EOF_FILE
@@ -1191,6 +1500,8 @@ jobs:
 
       - name: Build signed APK
         working-directory: build-app
+        env:
+          UPDATE_TOKEN: ${{ secrets.UPDATE_TOKEN }}
         run: gradle assembleRelease --no-daemon
 
       - name: Rename APK
